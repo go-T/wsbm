@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	flagRequest     = flag.Uint("n", 1, "Total request")
+	flagRequest     = flag.Uint("n", 0, "Total request")
 	flagConcurrency = flag.Uint("c", 1, "Concurrency")
 	flagQueries     = flag.String("q", "", "Text file contans url query per line")
 	flagDryRun      = flag.Bool("dryrun", false, "Dryrun")
@@ -87,11 +87,6 @@ func NewWsBenchmark(url string, queries []string) *WsBenchmark {
 }
 
 func (b *WsBenchmark) Run(request, concurrency int) {
-	if request < concurrency {
-		request = concurrency
-	}
-	logf("request: %d, concurrency:%d", request, concurrency)
-
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 
@@ -117,11 +112,6 @@ func (b *WsBenchmark) Run(request, concurrency int) {
 }
 
 func (b *WsBenchmark) DryRun(request, concurrency int) {
-	if request < concurrency {
-		request = concurrency
-	}
-	logf("request: %d, concurrency:%d", request, concurrency)
-
 	for id := 1; id <= request; id++ {
 		url, err := b.getUrl(id)
 		if err != nil {
@@ -218,10 +208,20 @@ options:`
 		panic(err)
 	}
 
+	request := int(*flagRequest)
+	concurrency := int(*flagConcurrency)
+	if request < 1 && len(queries) > 0 {
+		request = len(queries)
+	}
+	if request < concurrency {
+		request = concurrency
+	}
+	logf("request: %d, concurrency:%d", request, concurrency)
+
 	bm := NewWsBenchmark(flag.Arg(0), queries)
 	if *flagDryRun {
-		bm.DryRun(int(*flagRequest), int(*flagConcurrency))
+		bm.DryRun(request, concurrency)
 	} else {
-		bm.Run(int(*flagRequest), int(*flagConcurrency))
+		bm.Run(request, concurrency)
 	}
 }
