@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +19,9 @@ import (
 var (
 	flagRequest     = flag.Uint("n", 1, "Total request")
 	flagConcurrency = flag.Uint("c", 1, "Concurrency")
-	flagOutput      = flag.String("o", "-", "Output file, '-':stdout, '':null, 'filepath':'filepath-<id>.out'")
+	flagQueries     = flag.String("q", "", "Text file contans url query per line")
+	flagDryRun      = flag.Bool("dryrun", false, "Dryrun")
+	flagOutput      = flag.String("o", "-", "Output file, '-':stdout, '':null, 'filepath':'filepath.out'")
 )
 
 func logf(format string, v ...interface{}) {
@@ -43,19 +47,140 @@ func openOutput(id int) (io.WriteCloser, error) {
 	case "-":
 		return stdout{}, nil
 	default:
-		return os.Create(fmt.Sprintf("%s-%d.out", *flagOutput, id))
+		return os.Create(fmt.Sprintf("%s.%d", *flagOutput, id))
 	}
 }
 
-func worker(u *url.URL, id int) error {
+func loadQueries() ([]string, error) {
+	if *flagQueries == "" {
+		return nil, nil
+	}
+
+	file, err := os.Open(*flagQueries)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	reader := bufio.NewReader(file)
+	for {
+		line, _, err := reader.ReadLine()
+		if err != nil {
+			break
+		}
+		lines = append(lines, string(bytes.TrimSpace(line)))
+	}
+	return lines, nil
+}
+
+type WsBenchmark struct {
+	url     string
+	queries []string
+}
+
+func NewWsBenchmark(url string, queries []string) *WsBenchmark {
+	return &WsBenchmark{
+		url:     url,
+		queries: queries,
+	}
+}
+
+func (b *WsBenchmark) Run(request, concurrency int) {
+	if request < concurrency {
+		request = concurrency
+	}
+	logf("request: %d, concurrency:%d", request, concurrency)
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	var count int32
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				id := int(atomic.AddInt32(&count, 1))
+				if id > request {
+					return
+				}
+
+				if err := b.runTask(id); err != nil {
+					logf("run task %d err:%s", id, err)
+				} else {
+					logf("run task %d OK", id)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (b *WsBenchmark) DryRun(request, concurrency int) {
+	if request < concurrency {
+		request = concurrency
+	}
+	logf("request: %d, concurrency:%d", request, concurrency)
+
+	for id := 1; id <= request; id++ {
+		url, err := b.getUrl(id)
+		if err != nil {
+			logf("get url %d err:%s", id, err)
+			continue
+		}
+		logf("+ %d %s", id, url.String())
+	}
+}
+
+func (b *WsBenchmark) getUrl(id int) (*url.URL, error) {
+	rawUrl := strings.Replace(b.url, "<id>", fmt.Sprint(id), -1)
+
+	u, err := url.Parse(rawUrl)
+	if err != nil {
+		return nil, fmt.Errorf("parse url %s err:%s", rawUrl, err.Error())
+	}
+
+	if len(b.queries) > 0 {
+		rawQuery := b.queries[id%len(b.queries)]
+		newQuery, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return nil, fmt.Errorf("parse query %s err:%s", rawQuery, err.Error())
+		}
+
+		query := u.Query()
+		for name, value := range newQuery {
+			query[name] = value
+		}
+		u.RawQuery = query.Encode()
+	}
+
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+	}
+
+	return u, nil
+}
+
+func (b *WsBenchmark) runTask(id int) error {
+	url, err := b.getUrl(id)
+	if err != nil {
+		return err
+	}
+
 	output, err := openOutput(id)
 	if err != nil {
 		return err
 	}
 	defer output.Close()
 
-	h := http.Header{"Origin": {"http://" + u.Host}}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), h)
+	logf("+ %d %s", id, url.String())
+
+	h := http.Header{"Origin": {"http://" + url.Host}}
+	conn, _, err := websocket.DefaultDialer.Dial(url.String(), h)
 	if err != nil {
 		return err
 	}
@@ -83,44 +208,20 @@ options:`
 	}
 	flag.Parse()
 
-	req, con := int(*flagRequest), int(*flagConcurrency)
-	if con > req {
-		req = con
+	if flag.Arg(0) == "" {
+		flag.Usage()
+		os.Exit(1)
 	}
-	logf("request: %d, concurrency:%d", req, con)
 
-	var wg sync.WaitGroup
-	wg.Add(con)
-
-	var count int32
-	for i := 0; i < con; i++ {
-		go func() {
-			defer wg.Done()
-			for {
-				id := int(atomic.AddInt32(&count, 1))
-				if id > req {
-					return
-				}
-
-				u, err := url.Parse(strings.Replace(flag.Arg(0), "<id>", fmt.Sprint(id), -1))
-				if err != nil {
-					panic(err)
-				}
-
-				switch u.Scheme {
-				case "http":
-					u.Scheme = "ws"
-				case "https":
-					u.Scheme = "wss"
-				default:
-				}
-
-				logf("+ %d %s", id, u.String())
-				if err = worker(u, id); err != nil {
-					logf("- %d %s", id, err)
-				}
-			}
-		}()
+	queries, err := loadQueries()
+	if err != nil {
+		panic(err)
 	}
-	wg.Wait()
+
+	bm := NewWsBenchmark(flag.Arg(0), queries)
+	if *flagDryRun {
+		bm.DryRun(int(*flagRequest), int(*flagConcurrency))
+	} else {
+		bm.Run(int(*flagRequest), int(*flagConcurrency))
+	}
 }
