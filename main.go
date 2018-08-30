@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -19,8 +20,8 @@ import (
 var (
 	flagRequest     = flag.Uint("n", 0, "Total request")
 	flagConcurrency = flag.Uint("c", 1, "Concurrency")
-	flagQueries     = flag.String("q", "", "Text file contans url query per line")
 	flagDryRun      = flag.Bool("dryrun", false, "Dryrun")
+	flagQueries     = flag.String("q", "", "Text file contans url query per line, json or plain text")
 	flagOutput      = flag.String("o", "-", "Output file, '-':stdout, '':null, 'filepath':'filepath.out'")
 )
 
@@ -37,7 +38,10 @@ type stdout struct{}
 
 func (s stdout) Close() error { return nil }
 func (s stdout) Write(p []byte) (n int, err error) {
-	return os.Stdout.Write(p)
+	p = bytes.TrimSpace(p)
+	n, err = os.Stdout.Write(p)
+	os.Stdout.Write([]byte{'\n'})
+	return
 }
 
 func openOutput(id int) (io.WriteCloser, error) {
@@ -51,7 +55,25 @@ func openOutput(id int) (io.WriteCloser, error) {
 	}
 }
 
-func loadQueries() ([]string, error) {
+func parseJson(line []byte) (url.Values, error) {
+	var node map[string]interface{}
+	err := json.Unmarshal(line, &node)
+	if err != nil {
+		return nil, err
+	}
+
+	var query = url.Values{}
+	for name, value := range node {
+		query.Set(name, fmt.Sprint(value))
+	}
+	return query, nil
+}
+
+func parseQuery(line []byte) (url.Values, error) {
+	return url.ParseQuery(string(line))
+}
+
+func loadQueries() ([]url.Values, error) {
 	if *flagQueries == "" {
 		return nil, nil
 	}
@@ -62,24 +84,41 @@ func loadQueries() ([]string, error) {
 	}
 	defer file.Close()
 
-	var lines []string
+	var quries []url.Values
+	var q url.Values
+
 	reader := bufio.NewReader(file)
 	for {
 		line, _, err := reader.ReadLine()
 		if err != nil {
 			break
 		}
-		lines = append(lines, string(bytes.TrimSpace(line)))
+
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		if line[0] == '{' {
+			q, err = parseJson(line)
+		} else {
+			q, err = parseQuery(line)
+		}
+		if err != nil {
+			logf("parse line %s err:%s", string(line), err)
+			continue
+		}
+		quries = append(quries, q)
 	}
-	return lines, nil
+	return quries, nil
 }
 
 type WsBenchmark struct {
 	url     string
-	queries []string
+	queries []url.Values
 }
 
-func NewWsBenchmark(url string, queries []string) *WsBenchmark {
+func NewWsBenchmark(url string, queries []url.Values) *WsBenchmark {
 	return &WsBenchmark{
 		url:     url,
 		queries: queries,
@@ -131,12 +170,7 @@ func (b *WsBenchmark) getUrl(id int) (*url.URL, error) {
 	}
 
 	if len(b.queries) > 0 {
-		rawQuery := b.queries[id%len(b.queries)]
-		newQuery, err := url.ParseQuery(rawQuery)
-		if err != nil {
-			return nil, fmt.Errorf("parse query %s err:%s", rawQuery, err.Error())
-		}
-
+		newQuery := b.queries[id%len(b.queries)]
 		query := u.Query()
 		for name, value := range newQuery {
 			query[name] = value
